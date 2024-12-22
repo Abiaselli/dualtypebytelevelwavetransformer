@@ -18,3 +18,39 @@ It also saves space in the GPU when the model is loaded or training, as rather t
 I hope you like it and I would love to hear any ideas or uses you find for my stuff! This should be compatible with most dataset types. Also, it uses MSE loss instead of cross entropy, and the current implementation has a warm up scheduler, although I included commented out code for other schedulers if you would like to try a different one.
 
 Austin Biaselli
+
+IMPORTS required:
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import json
+import threading
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pandas as pd
+from torch.utils.data import DataLoader
+import os
+import numpy as np
+import torch.amp
+from torch.optim.lr_scheduler import LambdaLR
+
+For inference the avobe +
+from tkinter import Tk, filedialog, Label, Entry, Button, Text, END, messagebox, StringVar, OptionMenu
+
+References
+
+Scalable MatMul-free Language Modeling
+Rui-Jie Zhu, Yu Zhang, Ethan Sifferman, Tyler Sheaves, Yiqiao Wang, Dustin Richmond, Peng Zhou, Jason K. Eshraghian
+	arXiv:2406.02528 [cs.CL]
+ 	(or arXiv:2406.02528v5 [cs.CL] for this version)
+ 
+https://doi.org/10.48550/arXiv.2406.02528
+
+Byte Latent Transformer: Patches Scale Better Than Tokens
+Artidoro Pagnoni, Ram Pasunuru, Pedro Rodriguez, John Nguyen, Benjamin Muller, Margaret Li, Chunting Zhou, Lili Yu, Jason Weston, Luke Zettlemoyer, Gargi Ghosh, Mike Lewis, Ari Holtzman, Srinivasan Iyer
+	arXiv:2412.09871 [cs.CL]
+ 	(or arXiv:2412.09871v1 [cs.CL] for this version)
+ 
+https://doi.org/10.48550/arXiv.2412.09871
+Focus to learn more
