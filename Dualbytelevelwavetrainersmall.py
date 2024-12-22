@@ -707,7 +707,7 @@ class UnifiedTransformerGUI:
         self.select_log_file()
 
         # Setup logging
-        logging.basicConfig(filename=self.log_file_path, level=logging.DEBUG,
+        logging.basicConfig(filename=self.log_file_path, level=logging.INFO,
                             format='%(asctime)s - %(levelname)s - %(message)s')
 
         logging.info(f"Using device: {self.device}")
