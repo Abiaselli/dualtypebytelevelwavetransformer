@@ -1239,9 +1239,11 @@ class UnifiedTransformerGUI:
                         return
 
                     optimizer.zero_grad()
-                    
+
+                    mask_batch=collate_fn_old(text_batch)
+
                     # Forward pass
-                    mask = generate_attention_mask(text_batch, num_heads=self.num_heads.get()).to(self.device)
+                    mask = generate_attention_mask(mask_batch, num_heads=self.num_heads.get()).to(self.device)
                     logging.debug(f"num_heads: {self.num_heads.get()}")
 
                 
