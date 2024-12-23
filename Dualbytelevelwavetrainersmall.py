@@ -9,7 +9,6 @@ import torch.nn.functional as F
 import pandas as pd
 from torch.utils.data import DataLoader
 import os
-import numpy as np
 import torch.amp
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -19,6 +18,8 @@ from torch.optim.lr_scheduler import LambdaLR
 print(f"CUDA Available: {torch.cuda.is_available()}")
 
 
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
 # Define EOS token (outside the standard byte range)
 EOS_TOKEN = 256
 
@@ -120,7 +121,7 @@ class RawTextDataset(torch.utils.data.Dataset):
         return preprocess_text(self.text_data[idx], max_seq_len=self.max_seq_length)
 
 
-def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
+def collate_fn_old(text_batch, max_seq_length=1024, embed_size=512, device =device):
     processed_batch = []
     for item in text_batch:
         if isinstance(item, str):
@@ -137,7 +138,7 @@ def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
     # Debug log for batch size
     logging.debug(f"Processed batch size (collate_fn): {len(processed_batch)}")
 
-    wave_embeddings = text_to_wave_embeddings(
+    wave_embeddings = bytes_to_wave_embeddings(
         byte_sequences=processed_batch,
         max_seq_length=max_seq_length,
         embed_size=embed_size,
@@ -145,9 +146,25 @@ def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
     )
     return wave_embeddings
 
+def collate_fn(batch, max_seq_length=1024, padding_value=0):
+    """
+    Collate function to pad sequences to the same length in a batch.
+    """
+    # Find the maximum sequence length in the batch
+    batch_max_len = min(max(len(item) for item in batch), max_seq_length)
+    
+    # Pad each sequence to the batch's maximum length
+    padded_batch = []
+    for item in batch:
+        padded_item = torch.cat([item, torch.full((batch_max_len - len(item),), padding_value)], dim=0)
+        padded_batch.append(padded_item)
+    
+    # Stack all padded tensors
+    return torch.stack(padded_batch, dim=0)
 
 
-def text_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device="cuda"):
+
+def bytes_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device =device):
     """
     Converts a batch of byte sequences into wave-based embeddings aligned with the hidden size.
     Args:
@@ -162,7 +179,6 @@ def text_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device="
     # Ensure all sequences are tensors and pad if necessary
     padded_sequences = []
     for seq in byte_sequences:
-        logging.debug(f"Input sequence shape: {seq.shape}")
 
         if len(seq.shape) == 2 and seq.shape[1] == embed_size:
             # Already embedded: skip re-embedding
@@ -190,7 +206,7 @@ def text_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device="
 
     num_frequencies = embed_size
     frequencies = torch.arange(1, num_frequencies + 1, device=device).view(1, 1, -1)
-    phase_shifts = torch.linspace(0, 2 * np.pi, num_frequencies, device=device).view(1, 1, -1)
+    phase_shifts = torch.linspace(0, 2 * torch.pi, num_frequencies, device=device).view(1, 1, -1)
 
     # Amplitude (byte values normalized to [0, 1], including EOS_TOKEN)
     amplitude = torch.clamp(byte_matrix.unsqueeze(-1) / 256.0, 0, 1)  # Keep within [0, 1]
@@ -203,7 +219,6 @@ def text_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device="
     wave_embeddings = amplitude * wave_components  # Element-wise multiplication
 
     return wave_embeddings
-
 
 
 # MatMul-free Linear Gated Recurrent Unit (MLGRU) Cell
@@ -302,9 +317,9 @@ class MatMulFreeGLU(nn.Module):
 class MiniTransformerNode(nn.Module):
     def __init__(self, embed_size, num_heads, num_layers, hidden_size, vocab_size, max_seq_length):
         super().__init__()
-        self.embedding = nn.Embedding(hidden_size, embed_size)
+        self.embedding = nn.Embedding(hidden_size, vocab_size)
 
-        self.pos_encoder = WaveEmbeddingLayer(hidden_size, num_heads, max_seq_length)
+        self.pos_encoder = nn.Embedding(max_seq_length, embed_size)
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=num_heads, dim_feedforward=hidden_size, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -318,7 +333,7 @@ class MiniTransformerNode(nn.Module):
         x = torch.clamp(x.long(), min=0, max=257)
 
         if x.dim() == 2:  
-            embeddings = WaveEmbeddingLayer.forward(x)  # Shape: (batch_size, seq_length, embed_size)
+            embeddings = self.embedding(x)  # Shape: (batch_size, seq_length, embed_size)
         else:  
             embeddings = x  # If already embeddings, use them
 
@@ -421,7 +436,7 @@ class WaveCascadeTransformer(nn.Module):
 
 
 class WaveEmbeddingLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, max_seq_length, device ="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, hidden_size, num_heads, max_seq_length, device =device):
         """
         WaveEmbeddingLayer dynamically generates wave-based embeddings aligned with the model's hidden size.
         
@@ -454,26 +469,27 @@ class WaveEmbeddingLayer(nn.Module):
             wave_embeddings: Tensor of wave-based embeddings.
         """
         # Ensure all inputs are tensors
-        byte_sequences = []
+        processed_batch = []
         for item in text_batch:
             if isinstance(item, str):
-                byte_sequences.append(
-                    torch.tensor(
-                        list(item.encode('utf-8', errors='replace'))[:self.max_seq_length],
-                        dtype=torch.float32, device=self.device
-                    )
+                tensor = torch.tensor(
+                    list(item.encode('utf-8', errors='replace'))[:self.max_seq_length],
+                    dtype=torch.float32, device=device
                 )
             elif isinstance(item, torch.Tensor):
-                byte_sequences.append(item.to(self.device))
+                tensor = item.to(device)
             else:
                 raise TypeError(f"Unexpected type in text_batch: {type(item)}")
+            processed_batch.append(tensor)
 
-        # Generate wave embeddings
-        wave_embeddings = text_to_wave_embeddings(
-            byte_sequences=byte_sequences,
+        # Debug log for batch size
+        logging.debug(f"Processed batch size (collate_fn): {len(processed_batch)}")
+
+        wave_embeddings = bytes_to_wave_embeddings(
+            byte_sequences=processed_batch,
             max_seq_length=self.max_seq_length,
             embed_size=self.hidden_size,
-            device=self.device
+            device=device
         )
         return wave_embeddings
 
@@ -481,10 +497,11 @@ class WaveEmbeddingLayer(nn.Module):
 
 
 class ModifiedTransformerNode(nn.Module):
+    
     def __init__(self, embed_size, hidden_size, num_heads, num_layers, max_seq_length, num_frequencies=10):
         super().__init__()
         self.wave_embedding_layer = WaveEmbeddingLayer(
-            max_seq_length=max_seq_length, hidden_size=hidden_size, num_heads=num_heads, device="cuda"
+            max_seq_length=max_seq_length, hidden_size=hidden_size, num_heads=num_heads, device =device
         )
         self.transformer_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -511,7 +528,7 @@ class ModifiedTransformerNode(nn.Module):
         return output_embeddings
     
 
-def text_to_byte_sequence(input_text, max_seq_len=1024, vocab_size=257, eos_token=256, device="cuda"):
+def text_to_byte_sequence(input_text, max_seq_len=1024, vocab_size=257, eos_token=256, device =device):
     """
     Converts input text to a byte-level sequence with EOS token, scaled for vocab_size.
     """
@@ -521,7 +538,9 @@ def text_to_byte_sequence(input_text, max_seq_len=1024, vocab_size=257, eos_toke
     # Encode text to byte sequence
     byte_sequence = list(input_text.encode('utf-8')[:max_seq_len - 1])
     byte_sequence.append(eos_token)  # Append EOS token
+    return byte_sequence
 
+def byte_sequence_to_tensor(byte_sequence, max_seq_len=1024, vocab_size=257, eos_token=256, device =device):
     # Convert to tensor
     byte_tensor = torch.tensor(byte_sequence, dtype=torch.long, device=device)
 
@@ -543,10 +562,10 @@ def byte_sequence_to_text(byte_sequence):
 
 # MatMul-Free Language Model
 class MatMulFreeLanguageModel(nn.Module):
-    def __init__(self, embed_size, hidden_size, num_heads, max_seq_length, vocab_size=257, eps=1e-8, device ="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, embed_size, hidden_size, num_heads, max_seq_length, vocab_size=257, eps=1e-8, device =device):
         super().__init__()
         self.eps = eps
-        self.embedding = WaveEmbeddingLayer(hidden_size, num_heads,  max_seq_length)
+        self.embedding = nn.Embedding(hidden_size, vocab_size)
         self.num_heads = num_heads
         self.mlgru_layer = MLGRULayer(embed_size, hidden_size, eps)
         self.glu = MatMulFreeGLU(hidden_size, hidden_size, eps)
@@ -557,7 +576,7 @@ class MatMulFreeLanguageModel(nn.Module):
     def forward(self, input_ids, prev_node_output=None, src_mask=None, is_final_node=False):
         
         if input_ids.dim() == 2:  
-            x = WaveEmbeddingLayer.forward(input_ids.long())  # Shape: (batch_size, seq_length, embed_size)
+            x = self.embedding(input_ids.long())  # Shape: (batch_size, seq_length, embed_size)
         else:  
             x = input_ids  # If already embeddings, use them
         logging.debug(f"num_heads in MatMulFreeLanguageModel: {self.num_heads}")
@@ -923,14 +942,49 @@ class UnifiedTransformerGUI:
         sample_text = simpledialog.askstring("Test Wave Embeddings", "Enter a sample text to test:")
         if sample_text:
             try:
-                embeddings = text_to_wave_embeddings([sample_text], max_seq_length=1024, device=self.device)
-                logging.info(f"Wave Embeddings for '{sample_text}': {embeddings}")
-                messagebox.showinfo("Wave Embedding Test", f"Embeddings computed. Check logs for details.")
+                sample_text_bytes = text_to_byte_sequence(sample_text)
+                embeddings = self.str_to_embeddings(text_batch=sample_text)
+                logging.info(f"Wave Embeddings for '{sample_text}': {embeddings}:sample text bytes: {sample_text_bytes}")
+                messagebox.showinfo("Wave Embedding Test", f"Embeddings computed. Check logs for details.") 
             except Exception as e:
                 logging.error(f"Failed to compute wave embeddings: {e}")
                 messagebox.showerror("Error", f"Failed to compute wave embeddings: {e}")
 
 
+    def str_to_embeddings(self, text_batch, max_seq_length=1024, embed_size=512, device =device):
+        """
+        Forward pass to generate wave-based embeddings.
+        Args:
+            text_batch: List of raw text strings or tensors.
+            
+        Returns:
+            wave_embeddings: Tensor of wave-based embeddings.
+        """
+        # Ensure all inputs are tensors
+        processed_batch = []
+        for item in text_batch:
+            if isinstance(item, str):
+                tensor = torch.tensor(
+                    list(item.encode('utf-8', errors='replace'))[:max_seq_length],
+                    dtype=torch.float32, device=device
+                )
+            elif isinstance(item, torch.Tensor):
+                tensor = item.to(device)
+            else:
+                raise TypeError(f"Unexpected type in text_batch: {type(item)}")
+            processed_batch.append(tensor)
+
+        # Debug log for batch size
+        logging.debug(f"Processed batch size (collate_fn): {len(processed_batch)}")
+
+        wave_embeddings = bytes_to_wave_embeddings(
+            byte_sequences=processed_batch,
+            max_seq_length=max_seq_length,
+            embed_size=embed_size,
+            device=device
+        )
+        return wave_embeddings
+                
     def add_layer(self):
         layer_type = simpledialog.askstring("Layer Type", "Enter layer type (e.g., attention, feed_forward)")
         if layer_type:
@@ -1144,27 +1198,25 @@ class UnifiedTransformerGUI:
         dataloader = DataLoader(
             dataset,
             batch_size=self.batch_size.get(),
-            collate_fn=lambda batch: collate_fn(
-                batch,
-                max_seq_length=self.max_seq_length.get(),
-                embed_size=self.hidden_size.get(),
-                device=self.device
+            collate_fn=collate_fn
             )
-        )
+        
 
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate.get())
         total_steps = self.epochs.get() * len(dataloader)
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=0.5, total_iters=5, last_epoch=-1)
         #cosineannealingscheduler
         #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
         #warm-up scheduler
-        scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=10)
+        #scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, total_iters=10)
         #dynamic adjusting scheduler that reduces lr when loss plateaus
         #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5, min_lr=1e-6)
         #cyclic learning rate to explore loss landscape
         #scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=1e-5, max_lr=1e-3, step_size_up=2000, mode='triangular')
         # Lambda function for exponential increase
         #lr_scheduler = LambdaLR(optimizer, lambda x: 10 ** (x / 100))
+        n=0
 
 
         self.model.train()
@@ -1187,11 +1239,6 @@ class UnifiedTransformerGUI:
                         return
 
                     optimizer.zero_grad()
-
-                    # Ensure batch consistency
-                    if isinstance(text_batch[0], str):
-                        text_batch = collate_fn(text_batch)
-                        
                     
                     # Forward pass
                     mask = generate_attention_mask(text_batch, num_heads=self.num_heads.get()).to(self.device)
@@ -1255,21 +1302,22 @@ class UnifiedTransformerGUI:
                         if p.grad is not None:
                             total_norm += p.grad.data.norm(2).item() ** 2
                     total_norm = total_norm ** 0.5
-                    logging.debug(f"Gradient norm: {total_norm}")
+                    logging.info(f"Gradient norm: {total_norm}")
 
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     
                     total_norm = 0.0
                     for p in self.model.parameters():
                         if p.grad is not None:
                             total_norm += p.grad.data.norm(2).item() ** 2
                     total_norm = total_norm ** 0.5
-                    logging.debug(f"Gradient norm after clipping: {total_norm}")
+                    #logging.info(f"Gradient norm after clipping: {total_norm}")
 
                     optimizer.step()
                     #for lambda LR schedule testing
                     #lr_scheduler.step()
-                    #print(f"Iteration {text_batch[0]}, Loss: {loss.item()}, LR: {optimizer.param_groups[0]['lr']}")
+                    n+=1
+                    print(f"Iteration {n}, Loss: {loss.item()}, LR: {optimizer.param_groups[0]['lr']}")
                     scheduler.step()
 
                     epoch_loss += loss.item()

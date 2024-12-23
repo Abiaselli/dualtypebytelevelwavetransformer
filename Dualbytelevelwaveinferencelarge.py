@@ -18,7 +18,6 @@ print(f"CUDA Available: {torch.cuda.is_available()}")
 
 device ="cuda" if torch.cuda.is_available() else "cpu"
 # Set inference device to GPU if available
-
 # Define EOS token (outside the standard byte range)
 EOS_TOKEN = 65535
 
@@ -98,17 +97,12 @@ def matmul_free_linear(input, weight):
 
 def preprocess_text(text, max_seq_len=1024):
     """
-    Preprocess a single text by converting it to byte sequence and appending EOS token.
-    Args:
-        text (str): Input text string.
-        max_seq_len (int): Maximum sequence length including EOS token.
-
-    Returns:
-        Tensor: Byte sequence tensor with EOS token appended.
+    Converts text into byte sequence and appends EOS token.
     """
-    byte_sequence = list(text.encode('utf-8')[:max_seq_len - 1])  # Reserve space for EOS
-    byte_sequence.append(EOS_TOKEN)  # Append EOS token
+    byte_sequence = list(text.encode('utf-8')[:max_seq_len - 1])
+    byte_sequence.append(EOS_TOKEN)
     return torch.tensor(byte_sequence, dtype=torch.float32)
+
 
 class RawTextDataset(torch.utils.data.Dataset):
     def __init__(self, text_data, max_seq_length=1024):
@@ -125,7 +119,7 @@ class RawTextDataset(torch.utils.data.Dataset):
         return preprocess_text(self.text_data[idx], max_seq_len=self.max_seq_length)
 
 
-def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
+def collate_fn_old(text_batch, max_seq_length=1024, embed_size=512, device =device):
     processed_batch = []
     for item in text_batch:
         if isinstance(item, str):
@@ -142,7 +136,7 @@ def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
     # Debug log for batch size
     logging.debug(f"Processed batch size (collate_fn): {len(processed_batch)}")
 
-    wave_embeddings = text_to_wave_embeddings(
+    wave_embeddings = bytes_to_wave_embeddings(
         byte_sequences=processed_batch,
         max_seq_length=max_seq_length,
         embed_size=embed_size,
@@ -150,38 +144,75 @@ def collate_fn(text_batch, max_seq_length=1024, embed_size=512, device="cuda"):
     )
     return wave_embeddings
 
-
-
-def text_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device="cuda"):
+def collate_fn(batch, max_seq_length=1024, padding_value=0):
     """
-    Converts a batch of byte sequences into wave-based embeddings.
+    Collate function to pad sequences to the same length in a batch.
     """
-    if not byte_sequences:
-        raise ValueError("Byte sequences are empty or improperly formatted.")
+    # Find the maximum sequence length in the batch
+    batch_max_len = min(max(len(item) for item in batch), max_seq_length)
+    
+    # Pad each sequence to the batch's maximum length
+    padded_batch = []
+    for item in batch:
+        padded_item = torch.cat([item, torch.full((batch_max_len - len(item),), padding_value)], dim=0)
+        padded_batch.append(padded_item)
+    
+    # Stack all padded tensors
+    return torch.stack(padded_batch, dim=0)
 
-    # Pad sequences if necessary
+def bytes_to_wave_embeddings(byte_sequences, max_seq_length, embed_size, device =device):
+    """
+    Converts a batch of byte sequences into wave-based embeddings aligned with the hidden size.
+    Args:
+        byte_sequences: List of tensors or processed byte sequences.
+        max_seq_length: Maximum sequence length.
+        embed_size: Embedding size (matches hidden size).
+        device: Device for computations.
+
+    Returns:
+        wave_embeddings: Tensor of shape [batch_size, max_seq_length, embed_size].
+    """
+    # Ensure all sequences are tensors and pad if necessary
     padded_sequences = []
     for seq in byte_sequences:
-        if seq.dim() == 1:  # Ensure 1D tensors
+
+        if len(seq.shape) == 2 and seq.shape[1] == embed_size:
+            # Already embedded: skip re-embedding
+            logging.debug(f"Skipping re-embedding for sequence with shape: {seq.shape}")
+            padded_sequences.append(seq)
+        elif seq.dim() == 1:  # Ensure 1D tensors
             padded_sequences.append(
                 torch.cat([seq, torch.zeros(max_seq_length - seq.size(0), device=device)]) if seq.size(0) < max_seq_length else seq
             )
         else:
             raise ValueError(f"Unexpected sequence shape: {seq.shape}")
 
-    byte_matrix = torch.stack(padded_sequences)  # Shape: [batch_size, max_seq_length]
-    logging.debug(f"Byte matrix shape: {byte_matrix.shape}")
+    byte_matrix = torch.stack(padded_sequences)  # Shape: [batch_size, max_seq_length] or pre-embedded
+
+    # If already embedded, return as-is
+    if len(byte_matrix.shape) == 3:
+        return byte_matrix
+
+    # Debug log for tensor shape
+    logging.debug(f"byte_matrix shape: {byte_matrix.shape}")
 
     # Compute wave-based embeddings
     batch_size, seq_len = byte_matrix.size()
     positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    frequencies = torch.arange(1, embed_size + 1, device=device).view(1, 1, -1)
-    phase_shifts = torch.linspace(0, 2 * torch.pi, embed_size, device=device).view(1, 1, -1)
-    amplitude = torch.clamp(byte_matrix.unsqueeze(-1) / 65535.0, 0, 1)
-    amplitude[byte_matrix == EOS_TOKEN] = 1.1  # EOS token
 
+    num_frequencies = embed_size
+    frequencies = torch.arange(1, num_frequencies + 1, device=device).view(1, 1, -1)
+    phase_shifts = torch.linspace(0, 2 * torch.pi, num_frequencies, device=device).view(1, 1, -1)
+
+    # Amplitude (byte values normalized to [0, 1], including EOS_TOKEN)
+    amplitude = torch.clamp(byte_matrix.unsqueeze(-1) / 65535.0, 0, 1)  # Keep within [0, 1]
+    amplitude[byte_matrix == EOS_TOKEN] = 1.1  # Use a unique value for EOS token (e.g., 1.1)
+
+    # Positional wave components
     wave_components = torch.sin(positions.unsqueeze(-1) * frequencies + phase_shifts)
-    wave_embeddings = amplitude * wave_components
+
+    # Combine amplitude and wave components
+    wave_embeddings = amplitude * wave_components  # Element-wise multiplication
 
     return wave_embeddings
 
@@ -282,9 +313,9 @@ class MatMulFreeGLU(nn.Module):
 class MiniTransformerNode(nn.Module):
     def __init__(self, embed_size, num_heads, num_layers, hidden_size, vocab_size, max_seq_length):
         super().__init__()
-        self.embedding = nn.Embedding(hidden_size, embed_size)
+        self.embedding = nn.Embedding(hidden_size, vocab_size)
 
-        self.pos_encoder = WaveEmbeddingLayer(hidden_size, num_heads, max_seq_length)
+        self.pos_encoder = nn.Embedding(max_seq_length, embed_size)
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=num_heads, dim_feedforward=hidden_size, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -298,7 +329,7 @@ class MiniTransformerNode(nn.Module):
         x = torch.clamp(x.long(), min=0, max=65536)
 
         if x.dim() == 2:  
-            embeddings = WaveEmbeddingLayer.forward(x)  # Shape: (batch_size, seq_length, embed_size)
+            embeddings = self.embedding(x)  # Shape: (batch_size, seq_length, embed_size)
         else:  
             embeddings = x  # If already embeddings, use them
 
@@ -401,7 +432,7 @@ class WaveCascadeTransformer(nn.Module):
 
 
 class WaveEmbeddingLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, max_seq_length, device ="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, hidden_size, num_heads, max_seq_length, device =device):
         """
         WaveEmbeddingLayer dynamically generates wave-based embeddings aligned with the model's hidden size.
         
@@ -449,7 +480,7 @@ class WaveEmbeddingLayer(nn.Module):
                 raise TypeError(f"Unexpected type in text_batch: {type(item)}")
 
         # Generate wave embeddings
-        wave_embeddings = text_to_wave_embeddings(
+        wave_embeddings = bytes_to_wave_embeddings(
             byte_sequences=byte_sequences,
             max_seq_length=self.max_seq_length,
             embed_size=self.hidden_size,
@@ -461,10 +492,11 @@ class WaveEmbeddingLayer(nn.Module):
 
 
 class ModifiedTransformerNode(nn.Module):
+    
     def __init__(self, embed_size, hidden_size, num_heads, num_layers, max_seq_length, num_frequencies=10):
         super().__init__()
         self.wave_embedding_layer = WaveEmbeddingLayer(
-            max_seq_length=max_seq_length, hidden_size=hidden_size, num_heads=num_heads, device="cuda"
+            max_seq_length=max_seq_length, hidden_size=hidden_size, num_heads=num_heads, device = device
         )
         self.transformer_encoder = nn.TransformerEncoder(
             nn.TransformerEncoderLayer(
@@ -491,17 +523,44 @@ class ModifiedTransformerNode(nn.Module):
         return output_embeddings
     
 
-        
+def text_to_byte_sequence(input_text, max_seq_len=1024, vocab_size=65536, eos_token=65535, device =device):
+    """
+    Converts input text to a byte-level sequence with EOS token, scaled for vocab_size.
+    """
+    if not input_text:
+        raise ValueError("Input text is empty.")
 
+    # Encode text to byte sequence
+    byte_sequence = list(input_text.encode('utf-8')[:max_seq_len - 1])
+    byte_sequence.append(eos_token)  # Append EOS token
+    return byte_sequence
+
+def byte_sequence_to_tensor(byte_sequence, max_seq_len=1024, vocab_size=65536, eos_token=65535, device =device):
+    # Convert to tensor
+    byte_tensor = torch.tensor(byte_sequence, dtype=torch.long, device=device)
+
+    # Clamp values to fit vocab_size
+    byte_tensor = byte_tensor.clamp(0, vocab_size - 1)
+
+    return byte_tensor
+
+def byte_sequence_to_text(byte_sequence):
+    """
+    Decodes byte sequence into text, handling EOS and large vocab sizes.
+    """
+    decoded_text = ''.join(
+        chr(int(byte)) if 0 <= int(byte) <= 65535 else '?' for byte in byte_sequence if byte != EOS_TOKEN
+    )
+    return decoded_text
 
 
 
 # MatMul-Free Language Model
 class MatMulFreeLanguageModel(nn.Module):
-    def __init__(self, embed_size, hidden_size, num_heads, max_seq_length, vocab_size=65536, eps=1e-8, device ="cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, embed_size, hidden_size, num_heads, max_seq_length, vocab_size=65536, eps=1e-8, device =device):
         super().__init__()
         self.eps = eps
-        self.embedding = WaveEmbeddingLayer(hidden_size, num_heads,  max_seq_length)
+        self.embedding = nn.Embedding(hidden_size, vocab_size)
         self.num_heads = num_heads
         self.mlgru_layer = MLGRULayer(embed_size, hidden_size, eps)
         self.glu = MatMulFreeGLU(hidden_size, hidden_size, eps)
@@ -512,7 +571,7 @@ class MatMulFreeLanguageModel(nn.Module):
     def forward(self, input_ids, prev_node_output=None, src_mask=None, is_final_node=False):
         
         if input_ids.dim() == 2:  
-            x = WaveEmbeddingLayer.forward(input_ids.long())  # Shape: (batch_size, seq_length, embed_size)
+            x = self.embedding(input_ids.long())  # Shape: (batch_size, seq_length, embed_size)
         else:  
             x = input_ids  # If already embeddings, use them
         logging.debug(f"num_heads in MatMulFreeLanguageModel: {self.num_heads}")
@@ -611,6 +670,7 @@ def generate_attention_mask(embeddings, num_heads):
     return head_mask
 
 
+
 # Top-K and Top-P Filtering
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     batch_size, vocab_size = logits.size()
@@ -657,36 +717,8 @@ def load_model(model_path, device):
 
     return state_dict, model_parameters
 
-def text_to_byte_sequence(input_text, max_seq_len=1024, vocab_size=65536, eos_token=65535, device="cuda"):
-    """
-    Converts input text to a byte-level sequence with EOS token, scaled for vocab_size.
-    """
-    if not input_text:
-        raise ValueError("Input text is empty.")
 
-    # Encode text to byte sequence
-    byte_sequence = list(input_text.encode('utf-8')[:max_seq_len - 1])
-    byte_sequence.append(eos_token)  # Append EOS token
-
-    # Convert to tensor
-    byte_tensor = torch.tensor(byte_sequence, dtype=torch.long, device=device)
-
-    # Clamp values to fit vocab_size
-    byte_tensor = byte_tensor.clamp(0, vocab_size - 1)
-
-    return byte_tensor
-
-def byte_sequence_to_text(byte_sequence):
-    """
-    Decodes byte sequence into text, handling EOS and large vocab sizes.
-    """
-    decoded_text = ''.join(
-        chr(int(byte)) if 0 <= int(byte) <= 65535 else '?' for byte in byte_sequence if byte != EOS_TOKEN
-    )
-    return decoded_text
-
-
-def text_to_float_sequence(input_text, max_seq_len=1024, device="cuda"):
+def text_to_float_sequence(input_text, max_seq_len=1024, device=device):
     byte_sequence = list(input_text.encode('utf-8')[:max_seq_len - 1])  # Reserve space for EOS
     byte_sequence.append(EOS_TOKEN)  # Append EOS token
     return torch.tensor(byte_sequence, dtype=torch.float32, device=device) / 65535.0
@@ -825,7 +857,7 @@ class LanguageModelGUI:
         self.select_log_file()
 
         # Setup logging
-        logging.basicConfig(filename=self.log_file_path, level=logging.INFO,
+        logging.basicConfig(filename=self.log_file_path, level=logging.DEBUG,
                             format='%(asctime)s - %(levelname)s - %(message)s')
 
         logging.info(f"Using device: {device}")
@@ -993,6 +1025,7 @@ class LanguageModelGUI:
 
         # Convert input text to byte sequence
         input_ids = text_to_byte_sequence(input_text, max_seq_len=1024, device=device)
+        input_ids = byte_sequence_to_tensor(input_ids, max_seq_len=1024, device=device)
         logging.debug(f"Input IDs shape: {input_ids.shape}, content: {input_ids}")
 
         # Reshape for model compatibility
