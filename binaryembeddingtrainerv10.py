@@ -28,8 +28,7 @@ EOS_BINARY_INT = int("0011110000111100010001010100111101010011001111100011111000
 if EOS_BINARY_INT > 2**31 - 1:  # Ensure it doesn't exceed the range for a 32-bit int
     EOS_BINARY_INT = EOS_BINARY_INT % (2**31)
 EOS_BINARY_FLOAT = float(EOS_BINARY_INT)
-logging.debug(f"EOS_BINARY_INT: {EOS_BINARY_INT}")
-logging.debug(f"EOS_BINARY_FLOAT: {EOS_BINARY_FLOAT}")
+
 
 class QueryTargetDataset(Dataset):
     """
@@ -698,23 +697,24 @@ class MatMulFreeLanguageModel(nn.Module):
         output = x
 
         # Cross-node attention (global attention) - apply only if there is a previous node
-        wave_embeddings=x
         if prev_node_output is not None:
             # Generate a new attention mask
-            attn_mask = generate_attention_mask(wave_embeddings, self.num_heads, self.max_seq_length).to(self.device)
+            attn_mask = generate_attention_mask(output, self.num_heads, self.max_seq_length).to(self.device)
             logging.debug(f"Attention mask shape: {attn_mask.shape}")
 
             if src_mask is not None:
                 # Align src_mask to match attn_mask
-                batch_size, seq_length =wave_embeddings.size(0), wave_embeddings.size(1)
+                seq_length, binary_length =output.size(0), output.size(1)
 
                 # Ensure src_mask is [batch_size, seq_len, seq_len]
-                src_mask = src_mask.unsqueeze(0) if src_mask.dim() == 2 else src_mask
+                #src_mask = src_mask.unsqueeze(0) if src_mask.dim() == 2 else src_mask
                 logging.debug(f"src_mask shape before repeat: {src_mask.shape}")
 
                 # Align src_mask with attn_mask
                 #src_mask = src_mask.repeat_interleave(batch_size, dim=0)
-                #logging.debug(f"src_mask shape after repeat: {src_mask.shape}")
+                #src_mask = src_mask.repeat_interleave(seq_length, dim=0)
+
+                logging.debug(f"src_mask shape after repeat: {src_mask.shape}")
                 src_mask=src_mask 
                 logging.debug(f"src_mask shape: {src_mask.shape}")
 
@@ -739,10 +739,8 @@ class MatMulFreeLanguageModel(nn.Module):
         if is_final_node:
             output = self.output_layer(output)
 
-        logits = output
-        return logits, attention_weights
+        return output, attention_weights
 
-    
 # Generate src mask function
 def generate_square_subsequent_mask(sz):
     mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -1362,6 +1360,8 @@ class UnifiedTransformerGUI:
             messagebox.showerror("Error", "Training data is not selected or does not exist.")
             return False
 
+        logging.debug(f"EOS_BINARY_INT: {EOS_BINARY_INT}")
+        logging.debug(f"EOS_BINARY_FLOAT: {EOS_BINARY_FLOAT}")
         self.device=device
         dataset = QueryTargetDataset(queries=self.input_ids, targets=self.labels)  
         
