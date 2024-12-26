@@ -30,7 +30,6 @@ if EOS_BINARY_INT > 2**31 - 1:  # Ensure it doesn't exceed the range for a 32-bi
 EOS_BINARY_FLOAT = float(EOS_BINARY_INT)
 
 
-
 class QueryTargetDataset(Dataset):
     """
     A dataset class that handles queries (inputs) and targets (labels).
@@ -451,7 +450,7 @@ class WaveCascadeTransformer(nn.Module):
         self.num_layers=num_layers
         self.embed_size=hidden_size
         self.output_layer = nn.Linear(hidden_size, vocab_size)  # Predict binary probabilities for vocab_size binary positions.
-
+        self.device=device
 
         if include_preprocessing_node:
             self.preprocessing_node = ModifiedTransformerNode(
@@ -497,60 +496,61 @@ class WaveCascadeTransformer(nn.Module):
             attention_weights_all_nodes.append(attention_weights)
         return wave_embeddings, attention_weights_all_nodes
 
-
     def target_projection(self, target_input, mask=None):
         """
         Projects the target input into the same space as the model's output logits.
+        Converts binary target values into wave-based embeddings.
         """
-        # Generate wave embeddings from the target input
-        wave_embeddings = self.preprocessing_node(target_input)
+        # Convert binary input into wave embeddings and probabilities
+        binary_wave_embedding = BinaryWaveEmbedding(self.hidden_size).to(self.device)
+        wave_embeddings, probabilities = binary_wave_embedding(target_input)  # Probabilities: [seq_len, binary_length]
 
-        # Project embeddings into vocab size
-        projection = self.output_layer(wave_embeddings)  # Match vocab_size
-    
-        logging.debug(f"Target projection shape: {projection.shape}")
+        # If probabilities already have too many dimensions, adjust them
+        if probabilities.dim() == 4:  # If it has an extra dimension
+            probabilities = probabilities.squeeze(-1)  # Remove the unnecessary dimension
 
-        return projection
+        # Ensure probabilities have the correct dimensions
+        # Probabilities should be [seq_len, binary_length, embed_size]
+        probabilities = probabilities.unsqueeze(-1) if probabilities.dim() == 2 else probabilities  # Add missing dimension
+        probabilities = probabilities.expand(-1, -1, self.hidden_size)  # Expand to match embed_size
 
-class BinaryWaveEmbedding(nn.Module):
-    def __init__(self, embed_size):
-        super().__init__()
-        self.embed_size = embed_size
-        self.frequencies = nn.Parameter(torch.linspace(0.1, 1.0, embed_size))  # Learnable frequencies
-        self.phase_shifts = nn.Parameter(torch.zeros(embed_size))  # Learnable phase shifts
+        return probabilities
+
+            
+
 
 class BinaryWaveEmbedding(nn.Module):
     def __init__(self, embed_size):
         super(BinaryWaveEmbedding, self).__init__()
         self.embed_size = embed_size
+        self.frequencies = nn.Parameter(torch.linspace(0.1, 1.0, embed_size))  # Learnable frequencies
+        self.phase_shifts = nn.Parameter(torch.zeros(embed_size))  # Learnable phase shifts
 
     def forward(self, binary_input):
         try:
             # Validate input dimensions
-            assert binary_input.dim() == 2, "binary_input must be 2D (seq_len, chunk_len)"
-            seq_len, chunk_len = binary_input.shape
-
-            # Create positions tensor
-            positions = torch.arange(chunk_len, device=binary_input.device).unsqueeze(0).repeat(seq_len, 1)
+            assert binary_input.dim() == 2, "binary_input must be 2D (seq_len, binary_length)"
+            
+            seq_len, binary_len = binary_input.shape
+            
+            # Generate wave-like embedding
+            positions = torch.arange(binary_len, device=binary_input.device).unsqueeze(-1)
             logging.debug(f"Positions shape after arrange and repeat: {positions.shape}")
 
-            # Expand binary input to include embed_size
-            amplitude = binary_input.unsqueeze(-1) * 2 - 1  # Shape: [seq_len, chunk_len, 1]
-            amplitude = amplitude.expand(-1, -1, self.embed_size)  # Expand to [seq_len, chunk_len, embed_size]
+            amplitude = binary_input.unsqueeze(-1) * 2 - 1  # Map 0 -> -1, 1 -> 1
+            wave = amplitude * torch.sin(positions * self.frequencies + self.phase_shifts)
             logging.debug(f"Amplitude shape: {amplitude.shape}")
-
-            # Compute wave embedding
-            wave = torch.sin(amplitude * positions.unsqueeze(-1) * 2 * torch.pi / self.embed_size)  # [seq_len, chunk_len, embed_size]
             logging.debug(f"Wave shape: {wave.shape}")
 
             # Compute probabilities
-            probabilities = torch.abs(wave).sum(dim=-1)  # [seq_len, chunk_len]
+            probabilities = torch.abs(wave)
             logging.debug(f"Probabilities shape: {probabilities.shape}")
 
             return wave, probabilities
         except Exception as e:
             logging.error(f"Error in BinaryWaveEmbedding forward pass: {e}")
             raise
+
 
 
 class WaveEmbeddingLayer(nn.Module):
@@ -1443,29 +1443,24 @@ class UnifiedTransformerGUI:
                     logging.debug(f"Shape of logits: {logits.shape}")
                     logging.info(f"Logits sample: {logits[0]}")
 
-                    # Project targets to vocab size
-                    targets_projected = self.model.target_projection(list(target), mask=None)
+
+                    # Project targets into wave-based embeddings with probabilities
+                    targets_projected = self.model.target_projection(target, mask=None)
+
+                    # Ensure logits and targets_projected have matching dimensions
+                    assert logits.shape == targets_projected.shape, f"Shape mismatch: logits {logits.shape}, targets {targets_projected.shape}"
+
                     logging.debug(f"Shape of targets_projected: {targets_projected.shape}")
                     
 
-                    targets = torch.cat(
-                        [
-                            targets_projected[:, 1:],  # Shifted targets
-                            torch.full(
-                                (targets_projected.size(0), 1, targets_projected.size(2)),  # Shape
-                                EOS_BINARY_INT,  # Fill value
-                                device=targets_projected.device
-                            )
-                        ],
-                        dim=1
-                    )
+                    # Compute the loss
+                    loss_fn = torch.nn.BCEWithLogitsLoss()
+                    loss = loss_fn(logits, targets_projected)
 
                     # Shift targets for autoregressive training
-                    logging.debug(f"Shape of targets after projection: {targets.shape}")
-
-                    # Compute loss
-                    loss = F.binary_cross_entropy_with_logits(logits, targets)
-                    logging.info(f"Loss calculated: {loss}")
+                    logging.debug(f"Shape of targets after projection: {targets_projected.shape}")
+                    logging.debug(f"Logits:", logits[:1])  # First sequence for debugging
+                    logging.debug(f"Targets:", targets_projected[:1])
 
                     # Backward pass and optimization
                     loss.backward()
