@@ -1,4 +1,4 @@
-# Wave-based byte-leve embedding, tokenizer-free Transformer Mmodel training and inference
+# Wave-based byte-leve embedding, tokenizer-free Transformer Model training and inference
 A wave-based, byte-level,  tokenizer-free transformer trainer and inference program, with options for standard transformer and an RNN style GLU/GRU style intended to be used for the Matmul-Free implementation as outlined in the June 4th, 2024 reserach paper "Scalable MatMul-free Language Modeling"
 
 NOTE: Included is a test version of a binary embedings version I am working on, using query target pairs and a model that generates a probability wave for the probability of a bit being turned on at position x, over a set of 40 logits for each "token." No vocabulary obviously because it is meant to preprocess text to binary and then feed through the model, with inference being mediated by adjusting the probability threshold above which bits register as 1. Because it requires an extra dimension on tokens it currently only works with batch size of 1. 
